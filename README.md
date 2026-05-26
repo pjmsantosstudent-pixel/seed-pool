@@ -1,4 +1,5 @@
 # SeedPool
+<img width="1893" height="899" alt="Screenshot 2026-05-26 115851" src="https://github.com/user-attachments/assets/99489623-46e1-44f2-b072-5899f71a1211" />
 > On-chain micro-lending for smallholder farmers to buy seeds and fertilizer — no bank required.
 
 ---
