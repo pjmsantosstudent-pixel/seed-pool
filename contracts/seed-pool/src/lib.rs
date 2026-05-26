@@ -1,67 +1,121 @@
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short,
+    Address, Env, Map, Symbol,
+};
 
-// Struktur data yang akan menyimpan notes
+const LOANS: Symbol = symbol_short!("LOANS");
+const ADMIN: Symbol = symbol_short!("ADMIN");
+
+/// Represents a single micro-loan to a farmer
 #[contracttype]
-#[derive(Clone, Debug)]
-pub struct Note {
-    id: u64,
-    title: String,
-    content: String,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Loan {
+    pub farmer: Address,
+    pub principal: i128,       // Original amount disbursed
+    pub repaid: i128,          // Amount repaid so far
+    pub fully_repaid: bool,
 }
 
-// Storage key untuk data notes
-const NOTE_DATA: Symbol = symbol_short!("NOTE_DATA");
-
 #[contract]
-pub struct NotesContract;
+pub struct SeedPoolContract;
 
 #[contractimpl]
-impl NotesContract {
-    pub fn get_notes(env: Env) -> Vec<Note> {
-        // 1. ambil data notes dari storage
-        return env.storage().instance().get(&NOTE_DATA).unwrap_or(Vec::new(&env));
+impl SeedPoolContract {
+    /// NGO or cooperative admin initializes the lending contract
+    pub fn init(env: Env, admin: Address) {
+        if env.storage().instance().has(&ADMIN) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&ADMIN, &admin);
+        let loans: Map<Address, Loan> = Map::new(&env);
+        env.storage().instance().set(&LOANS, &loans);
     }
 
-    // Fungsi untuk membuat note baru
-    pub fn create_note(env: Env, title: String, content: String) -> String {
-        // 1. ambil data notes dari storage
-        let mut notes: Vec<Note> = env.storage().instance().get(&NOTE_DATA).unwrap_or(Vec::new(&env));
-        
-        // 2. Buat object note baru
-        let note = Note {
-            id: env.prng().gen::<u64>(),
-            title: title,
-            content: content,
-        };
-        
-        // 3. tambahkan note baru ke notes lama
-        notes.push_back(note);
-        
-        // 4. simpan notes ke storage
-        env.storage().instance().set(&NOTE_DATA, &notes);
-        
-        return String::from_str(&env, "Notes berhasil ditambahkan");
-    }
+    /// Admin issues a micro-loan to a farmer for seed or fertilizer purchase.
+    /// USDC is transferred directly to farmer's wallet. Loan record is stored on-chain.
+    pub fn issue_loan(
+        env: Env,
+        admin: Address,
+        farmer: Address,
+        token: Address,
+        amount: i128,
+    ) {
+        admin.require_auth();
 
-    // Fungsi untuk menghapus notes berdasarkan id
-    pub fn delete_note(env: Env, id: u64) -> String {
-        // 1. ambil data notes dari storage 
-        let mut notes: Vec<Note> = env.storage().instance().get(&NOTE_DATA).unwrap_or(Vec::new(&env));
+        let stored_admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        if admin != stored_admin {
+            panic!("unauthorized");
+        }
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
 
-        // 2. cari index note yang akan dihapus menggunakan perulangan
-        for i in 0..notes.len() {
-            if notes.get(i).unwrap().id == id {
-                notes.remove(i);
+        let mut loans: Map<Address, Loan> =
+            env.storage().instance().get(&LOANS).unwrap();
 
-                env.storage().instance().set(&NOTE_DATA, &notes);
-                return String::from_str(&env, "Berhasil hapus notes");
+        // Prevent duplicate active loan for same farmer
+        if loans.contains_key(farmer.clone()) {
+            let existing: Loan = loans.get(farmer.clone()).unwrap();
+            if !existing.fully_repaid {
+                panic!("farmer has active loan");
             }
         }
 
-        return String::from_str(&env, "Notes tidak ditemukan")
+        // Disburse USDC from admin/contract to farmer
+        let client = soroban_sdk::token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &farmer, &amount);
+
+        // Record loan on-chain
+        let loan = Loan {
+            farmer: farmer.clone(),
+            principal: amount,
+            repaid: 0,
+            fully_repaid: false,
+        };
+        loans.set(farmer, loan);
+        env.storage().instance().set(&LOANS, &loans);
+    }
+
+    /// Farmer repays part or all of the loan.
+    /// Partial repayments are tracked; full repayment marks loan as closed.
+    pub fn repay(env: Env, farmer: Address, token: Address, amount: i128) {
+        farmer.require_auth();
+
+        if amount <= 0 {
+            panic!("repay amount must be positive");
+        }
+
+        let mut loans: Map<Address, Loan> =
+            env.storage().instance().get(&LOANS).unwrap();
+
+        let mut loan: Loan = loans.get(farmer.clone()).expect("no loan found");
+
+        if loan.fully_repaid {
+            panic!("loan already repaid");
+        }
+
+        let remaining = loan.principal - loan.repaid;
+        let actual_repay = if amount > remaining { remaining } else { amount };
+
+        // Transfer USDC from farmer back to contract (repayment pool)
+        let client = soroban_sdk::token::Client::new(&env, &token);
+        client.transfer(&farmer, &env.current_contract_address(), &actual_repay);
+
+        loan.repaid += actual_repay;
+        if loan.repaid >= loan.principal {
+            loan.fully_repaid = true;
+        }
+
+        loans.set(farmer, loan);
+        env.storage().instance().set(&LOANS, &loans);
+    }
+
+    /// Check a farmer's loan status
+    pub fn get_loan(env: Env, farmer: Address) -> Loan {
+        let loans: Map<Address, Loan> =
+            env.storage().instance().get(&LOANS).unwrap();
+        loans.get(farmer).expect("no loan found")
     }
 }
-
-mod test;
